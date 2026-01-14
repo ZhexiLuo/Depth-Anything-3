@@ -35,6 +35,7 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 import argparse
 import cv2
 import numpy as np
+import torch
 from pathlib import Path
 from flask import Flask, request, jsonify
 from PIL import Image
@@ -44,13 +45,16 @@ from depth_anything_3.api import DepthAnything3
 
 app = Flask(__name__)
 model = None
+gpu_id = 0
 
 
-def load_model():
+def load_model(device_id: int = 0):
     """Load DA3 model globally."""
-    global model
-    print("Loading DA3-Large model...")
-    model = DepthAnything3.from_pretrained("depth-anything/DA3-Large").to("cuda")
+    global model, gpu_id
+    gpu_id = device_id
+    print(f"Loading DA3-Large model on GPU {gpu_id}...")
+    torch.cuda.set_device(gpu_id)
+    model = DepthAnything3.from_pretrained("depth-anything/DA3-Large").to(f"cuda:{gpu_id}")
     print("Model loaded successfully.")
 
 
@@ -100,15 +104,16 @@ def estimate():
         if save_depth_vis:
             export_formats.append("depth_vis")
 
-        export_format = "-".join(export_formats) if export_formats else None
-        export_dir = output_dir if export_format else None
+        export_format = "-".join(export_formats) if export_formats else ""
+        # Use task-specific temp dir to avoid race conditions
+        temp_export_dir = Path(output_dir) / f".tmp_{output_name}" if export_format else None
 
         # Inference
         prediction = model.inference(
             image=[image_path],
             intrinsics=intrinsics[None, ...],
             process_res=process_res,
-            export_dir=export_dir,
+            export_dir=str(temp_export_dir) if temp_export_dir else None,
             export_format=export_format,
             conf_thresh_percentile=glb_conf_thresh_percentile,
             num_max_points=glb_num_max_points,
@@ -141,21 +146,25 @@ def estimate():
             outputs["conf"] = str(conf_path)
 
         # Rename depth_vis output
-        if save_depth_vis:
-            # DA3 saves as "output_depth_vis.png"
-            depth_vis_path = Path(output_dir) / "output_depth_vis.png"
+        if save_depth_vis and temp_export_dir:
+            depth_vis_path = temp_export_dir / "depth_vis" / "0000.jpg"
             if depth_vis_path.exists():
-                renamed_path = Path(output_dir) / f"{output_name}_depth_vis.png"
+                renamed_path = Path(output_dir) / f"{output_name}_depth_vis.jpg"
                 depth_vis_path.rename(renamed_path)
                 outputs["depth_vis"] = str(renamed_path)
 
         # Rename GLB output
-        if save_glb:
-            glb_path = Path(output_dir) / "output.glb"
+        if save_glb and temp_export_dir:
+            glb_path = temp_export_dir / "scene.glb"
             if glb_path.exists():
                 renamed_glb = Path(output_dir) / f"{output_name}.glb"
                 glb_path.rename(renamed_glb)
                 outputs["glb"] = str(renamed_glb)
+
+        # Cleanup temp export dir
+        if temp_export_dir and temp_export_dir.exists():
+            import shutil
+            shutil.rmtree(temp_export_dir)
 
         return jsonify({
             "status": "success",
@@ -180,11 +189,12 @@ def main():
     parser = argparse.ArgumentParser(description="Depth Anything 3 Server")
     parser.add_argument("--port", type=int, default=5003, help="Server port")
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Server host")
+    parser.add_argument("--gpu", type=int, default=0, help="GPU device ID")
     args = parser.parse_args()
 
-    load_model()
+    load_model(args.gpu)
 
-    print(f"Starting server on {args.host}:{args.port}")
+    print(f"Starting server on {args.host}:{args.port} (GPU {args.gpu})")
     app.run(host=args.host, port=args.port, threaded=False)
 
 
